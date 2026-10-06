@@ -1,0 +1,4 @@
+# Laid by Claude Code when it loads the mod: the API's types, for the editor and tsc.
+.claude-plugin/types/
+node_modules/
+.DS_Store

@@ -1,0 +1,13 @@
+{
+  "name": "slash-coverage",
+  "description": "slash-coverage: see which files each Claude Code agent has in its context.",
+  "owner": {
+    "name": "Davron Djabborov"
+  },
+  "plugins": [
+    {
+      "name": "slash-coverage",
+      "source": "./"
+    }
+  ]
+}
