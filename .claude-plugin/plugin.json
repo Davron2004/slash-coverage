@@ -1,7 +1,7 @@
 {
   "name": "slash-coverage",
   "version": "0.1.0",
-  "description": "Which files each Claude Code agent has in its context, and how much of each: line ranges, tokens, re-reads, edits, and what it only knows through a subagent.",
+  "description": "Which files each Claude Code agent has in its context, and how much of each: line ranges, tokens, re-reads, edits, and which files only a subagent it spawned has read.",
   "author": {
     "name": "Davron Djabborov"
   },

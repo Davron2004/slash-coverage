@@ -2,7 +2,7 @@
 
 A Claude Code mod that shows which files each agent has in its context, and how much of each.
 
-When Claude spawns subagents, the main session doesn't get the files they read. It gets their reports. slash-coverage keeps that visible: for the main session and every subagent, which files it holds in full, which only in part (and which lines), which it knows only through a subagent, which copies went stale after an edit, and what each one costs in tokens.
+When Claude spawns subagents, the files they read go into their contexts, not the main session's. slash-coverage keeps that visible: for the main session and every subagent, which files it holds in full, which only in part (and which lines), which it never read itself but a subagent it spawned did, which copies went stale after an edit, and what each one costs in tokens.
 
 ![Coverage, one agent](docs/coverage.png)
 
@@ -35,7 +35,7 @@ Pick an agent in the row at the top, and every column describes that agent:
 | `●` | The whole file, current |
 | `◉` | Some of its lines |
 | `●` (orange) | Read before another agent edited it |
-| `◌` | A subagent this agent spawned holds it, so this agent has only that subagent's report |
+| `◌` | This agent never read it, but a subagent it spawned did |
 | `○` | Named in a search, listing or line count, never opened |
 | `✕` | Read, then dropped by compaction |
 | `◆` | The file an agent is working on right now |
@@ -65,7 +65,7 @@ Every value comes from tool calls Claude Code already makes, and nothing asks an
 - **Grep** and **Glob** results, and shell commands that search or count (`grep`, `rg`, `wc`), give search hits. A path only counts when it starts a line of the output, so a file merely mentioned inside another file's content doesn't.
 - **Shell reads** (`cat`, `sed`, `head`) are parsed, with `cd`s followed and globs expanded. Their exact lines are unknown, so they show as partial. `git status` after each command catches files a command changed.
 - **Spawns** give each subagent's parent, and a subagent counts as done when its turn ends.
-- **Secondhand** (`◌`) is structural: a subagent you spawned read the file. Nothing judges what its report said.
+- **Secondhand** (`◌`) is structural: a subagent you spawned read the file. What its report said about the file isn't tracked.
 
 ## It survives a restart
 
