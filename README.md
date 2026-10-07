@@ -40,7 +40,7 @@ Pick an agent in the row at the top, and every column describes that agent:
 | `✕` | Read, then dropped by compaction |
 | `◆` | The file an agent is working on right now |
 
-Rows are every file any agent touched, so switching agents changes the cells but never moves the rows. Untouched files fold into one "N untouched" line per folder. A folder's row sums what's inside it, strongest first: short runs as glyphs, longer ones counted, `●● ◉ ◌14 ○○○ 20/31`. Click a file for what every agent knows of it, and a folder to fold it.
+Rows are the files the picked agent knows: its own, and those a subagent it spawned read. So main lists everything, and a subagent lists only what it touched. In all, rows are every file any agent touched. Untouched files fold into one "N untouched" line per folder. A folder's row sums what's inside it, strongest first: short runs as glyphs, longer ones counted, `●● ◉ ◌14 ○○○ 20/31`. Click a file for what every agent knows of it, and a folder to fold it.
 
 | Key | Does |
 | --- | --- |
@@ -54,7 +54,7 @@ Rows are every file any agent touched, so switching agents changes the cells but
 
 `a` puts one narrow column per agent next to the file tree, then the team's tokens and last touch. It shows what no single agent's view can: two subagents paying for the same file, and folders no agent covered.
 
-Each agent's header is a numbered toggle. Press its number (`2` for `2: ex1`) to leave that agent out of the view, as if it never ran. Its column stays, dimmed as `⊘ex1`, and the same number brings it back. So you can see what your backend agents know without the UI agent's reads mixed in.
+Each agent's header is a numbered toggle. Press its number (`2` for `2: ex1`) to leave that agent out of the view, as if it never ran. Its column goes and the others close up. It waits under the grid in a "left out" line, as `⊘ex1`: click it to bring it back, or press `0` to bring back every agent left out. So you can see what your backend agents know without the UI agent's reads mixed in.
 
 ## How it works
 
@@ -63,7 +63,8 @@ Every value comes from tool calls Claude Code already makes, and nothing asks an
 - **Read** results give the exact line ranges and the file's length.
 - **Edit** and **Write** patches give lines added and removed. They also shift the editor's own line ranges, and they mark every other agent's copy of the file stale.
 - **Grep** and **Glob** results, and shell commands that search or count (`grep`, `rg`, `wc`), give search hits. A path only counts when it starts a line of the output, so a file merely mentioned inside another file's content doesn't.
-- **Shell reads** (`cat`, `sed`, `head`) are parsed, with `cd`s followed and globs expanded. Their exact lines are unknown, so they show as partial. `git status` after each command catches files a command changed.
+- **Shell reads** are parsed as shell: quotes, heredocs, redirects, pipes and `for` loops, with `cd`s followed and globs expanded. Only commands that print file content count as reads, so `python3 x.py` or a heredoc's code never does, and output sent to a file doesn't either. `cat`, `nl`, `head`, `tail`, `sed -n 'A,Bp'` and `awk 'NR>=A && NR<=B'` give exact lines, through pipes too (`cat -n f | sed -n 10,20p` is lines 10–20). When Claude Code kept only a preview of a long output, only the lines in the preview count. `git status` after each command catches files a command changed.
+- **Worktrees** of the repo (`git worktree list`) map onto the repo's own paths, so a subagent working in `../app-feature` or `.claude/worktrees/x` fills in the same rows as main.
 - **Spawns** give each subagent's parent, and a subagent counts as done when its turn ends.
 - **Secondhand** (`◌`) is structural: a subagent you spawned read the file. What its report said about the file isn't tracked.
 
@@ -75,7 +76,7 @@ slash-coverage keeps a log per agent of what it read, searched and edited, and s
 
 - Files Claude Code loads on its own, like `CLAUDE.md`, never pass through a tool call, so they don't show.
 - Token counts are estimates (characters ÷ 4).
-- A shell read's lines are unknown, so it never counts as a full read.
+- A shell read through something the parser can't follow (`sed '/re/,/re/p'`, a script, `xargs`) holds unknown lines, so it shows as partial.
 - A forked chat starts empty: the fork gets a new folder, and the logs aren't copied into it.
 - Only the terminal has been checked visually. The desktop app draws the same elements, untested.
 - The glyphs are chosen to sit in one cell of JetBrains Mono (Ghostty's default font). A font that lacks them can draw them wider.

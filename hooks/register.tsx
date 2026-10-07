@@ -15,7 +15,7 @@ import {
   via,
 } from './knowledge'
 import { type GpsEvent, type GpsState, MAIN, type Snapshot, applyEvent, parseSnapshot, replay, snapshotDir, spawnedIn } from './events'
-import { type FileEntry, type Repo, makeRepo, pathsIn, pathsInCommand, relative } from './paths'
+import { type Checkout, type FileEntry, type Repo, absolute, checkoutOf, logical, makeRepo, pathsIn, shellEffects } from './paths'
 
 type $ = EngineInterface
 
@@ -31,6 +31,7 @@ const holdsAtom = atom({ plugin: 'slash-coverage', key: 'holds' } as const, {} a
 const linesAtom = atom({ plugin: 'slash-coverage', key: 'lines' } as const, {} as Record<string, number>)
 const agentsAtom = atom({ plugin: 'slash-coverage', key: 'agents' } as const, [] as GpsAgent[])
 const pickAtom = atom({ plugin: 'slash-coverage', key: 'pick' } as const, 'auto')
+const anchorAtom = atom({ plugin: 'slash-coverage', key: 'anchor' } as const, null as string | null)
 const closedAtom = atom({ plugin: 'slash-coverage', key: 'closed' } as const, [] as string[])
 const excludedAtom = atom({ plugin: 'slash-coverage', key: 'excluded' } as const, [] as string[])
 const selectedAtom = atom({ plugin: 'slash-coverage', key: 'selected' } as const, null as string | null)
@@ -53,23 +54,59 @@ const AGENT_HUES = ['#7aa2f7', '#73d0a0', '#e7a0d0', '#7fd4e6', '#e5c07b', '#c3a
 
 // ── The repo index (module memory: rebuilt cheaply after a reload) ──────────
 let repo: Repo = makeRepo('', [])
+/** Where the session runs: an agent's shell starts here. */
+let sessionCwd = ''
+/** Each agent's shell cwd after its last command, absolute. */
+let cwds = new Map<string, string>()
 /** Settles once the index is built; tool calls that arrive sooner (right after a reload) wait for it. */
 let indexed: Promise<void> = Promise.resolve()
 /** Each folder's files, nested ones included, and its direct children. */
 let folders: { count: Map<string, number>; children: Map<string, Set<string>> } | null = null
-/** mtimes of the files git reports changed, to tell a fresh edit from an old one. */
+/** mtimes of the files git reports changed, by absolute path, to tell a fresh edit from an old one. */
 let changed = new Map<string, number>()
 /** The git repos the index covers, relative to its root: [''] when the root is one. */
 let gitRoots: string[] = []
+/** Every checkout git runs in: each repo's own, and each of its worktrees. */
+let gitCheckouts: Checkout[] = []
+/** Checkouts whose git status has been taken: a later one tells what a command changed. */
+let seen = new Set<string>()
 
-/** Runs git in the repo root, or in a nested repo (`at`, relative to the root). */
+/** Runs git in the repo root, or in a nested repo (`at`, relative to the root), or in a directory given absolute. */
 async function git($: $, args: string[], at = '') {
   try {
-    const r = await $.process.run(['git', ...args], { cwd: at ? repo.root + '/' + at : repo.root, timeoutMs: 15_000 })
+    const cwd = at.startsWith('/') ? at : at ? repo.root + '/' + at : repo.root
+    const r = await $.process.run(['git', ...args], { cwd, timeoutMs: 15_000 })
     return r.exitCode === 0 ? r.stdout : null
   } catch {
     return null
   }
+}
+
+/** Each repo's worktrees, shown where the repo is: their files are its files. */
+async function listCheckouts($: $): Promise<Checkout[]> {
+  const out: Checkout[] = []
+  for (const at of gitRoots) {
+    const main = at ? repo.root + '/' + at : repo.root
+    out.push({ dir: main, prefix: at })
+    const list = (await git($, ['worktree', 'list', '--porcelain'], at)) ?? ''
+    for (const line of list.split('\n')) {
+      const dir = line.startsWith('worktree ') ? line.slice(9).trim() : ''
+      if (dir && dir !== main) out.push({ dir, prefix: at })
+    }
+  }
+  return out
+}
+
+/** Directories outside every checkout already looked at: each could be a worktree made since the index. */
+let outsideSeen = new Set<string>()
+
+/** Lists the worktrees again when a path lies outside every checkout and its directory is new. */
+async function placeOutside($: $, paths: readonly string[]) {
+  const fresh = paths.filter(p => !checkoutOf(repo, p)).map(p => p.slice(0, p.lastIndexOf('/')) || '/').filter(d => !outsideSeen.has(d))
+  if (!fresh.length) return
+  for (const d of fresh) outsideSeen.add(d)
+  gitCheckouts = await listCheckouts($)
+  repo = makeRepo(repo.root, repo.files, gitCheckouts, repo.home)
 }
 
 /** A repo's tracked files, plus untracked ones git doesn't ignore. */
@@ -132,12 +169,14 @@ async function walk($: $, dir: string, out: FileEntry[], repos: ReadonlySet<stri
 
 async function indexRepo($: $) {
   let root = await $.session.root()
-  repo = makeRepo(root, [])
+  sessionCwd = await $.session.cwd()
+  const home = (await $.env.get('HOME')) ?? ''
+  repo = makeRepo(root, [], [], home)
   const top = await git($, ['rev-parse', '--show-toplevel'])
   const list: FileEntry[] = []
   if (top) {
     root = top.trim()
-    repo = makeRepo(root, [])
+    repo = makeRepo(root, [], [], home)
     gitRoots = ['']
     list.push(...(await trackedFiles($, '')))
   } else {
@@ -145,9 +184,14 @@ async function indexRepo($: $) {
     for (const at of gitRoots) list.push(...(await trackedFiles($, at)))
     await walk($, '', list, new Set(gitRoots))
   }
-  repo = makeRepo(root, list.slice(0, MAX_FILES))
+  gitCheckouts = await listCheckouts($)
+  repo = makeRepo(root, list.slice(0, MAX_FILES), gitCheckouts, home)
   folders = null
-  await serial(() => snapshotChanges($))
+  outsideSeen = new Set()
+  seen = new Set()
+  changed = new Map()
+  // Worktrees are looked at when an agent first works in one.
+  await serial(() => snapshotChanges($, gitCheckouts.filter(c => c.dir === (c.prefix ? root + '/' + c.prefix : root))))
   await update($, indexAtom, v => v + 1)
 }
 
@@ -189,25 +233,25 @@ function serial<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
-/** The repos a command or edit could have changed: the ones its paths or working directory fall in. */
-function reposFor(paths: readonly string[], cwd = ''): string[] {
-  if (gitRoots.length === 1 && gitRoots[0] === '') return ['']
-  const places = cwd ? [...paths, cwd] : paths
-  return gitRoots.filter(r => places.some(p => p === r || p.startsWith(r + '/')))
+/** The checkouts a command or edit could have changed: the ones holding its paths or the directories it worked in. */
+function checkoutsFor(places: readonly string[]): Checkout[] {
+  return gitCheckouts.filter(c => places.some(p => p === c.dir || p.startsWith(c.dir + '/')))
 }
 
-/** Re-reads git status for some repos; the snapshot is built aside and swapped in whole. */
-async function snapshotChanges($: $, roots: readonly string[] = gitRoots) {
-  const next = new Map([...changed].filter(([path]) => !roots.some(r => r === '' || path.startsWith(r + '/'))))
-  for (const at of roots) {
-    const status = await git($, ['status', '--porcelain', '--untracked-files=all'], at)
+/** Re-reads git status in some checkouts; the snapshot is built aside and swapped in whole. */
+async function snapshotChanges($: $, roots: readonly Checkout[]) {
+  const inside = (path: string) => roots.some(c => path.startsWith(c.dir + '/'))
+  const next = new Map([...changed].filter(([path]) => !inside(path)))
+  for (const c of roots) {
+    const status = await git($, ['status', '--porcelain', '--untracked-files=all'], c.dir)
     if (status === null) continue
+    seen.add(c.dir)
     for (const line of status.split('\n')) {
-      const rel = line.slice(3).split(' -> ').pop()?.trim()
+      const rel = line.slice(3).split(' -> ').pop()?.trim().replace(/^"|"$/g, '')
       if (!rel) continue
-      const path = (at ? at + '/' : '') + rel
+      const path = c.dir + '/' + rel
       try {
-        next.set(path, (await $.fs.stat(repo.root + '/' + path)).mtimeMs)
+        next.set(path, (await $.fs.stat(path)).mtimeMs)
       } catch {
         next.set(path, 0)
       }
@@ -216,8 +260,14 @@ async function snapshotChanges($: $, roots: readonly string[] = gitRoots) {
   changed = next
 }
 
-/** Files git now reports changed whose mtime moved since the last look: edits by any tool, shell included. */
-function freshEdits($: $, roots: readonly string[]): Promise<string[]> {
+/** Takes git status in checkouts not looked at yet, so their old changes don't read as this command's. */
+function lookFirst($: $, roots: readonly Checkout[]) {
+  const fresh = roots.filter(c => !seen.has(c.dir))
+  return fresh.length ? serial(() => snapshotChanges($, fresh)) : Promise.resolve()
+}
+
+/** Files git now reports changed whose mtime moved since the last look, absolute: edits by any tool, shell included. */
+function freshEdits($: $, roots: readonly Checkout[]): Promise<string[]> {
   if (roots.length === 0) return Promise.resolve([])
   return serial(async () => {
     const before = changed
@@ -319,6 +369,7 @@ async function reset($: $) {
   await update($, agentsAtom, () => [])
   await update($, selectedAtom, () => null)
   await update($, pickAtom, () => 'auto')
+  await update($, anchorAtom, () => null)
   await update($, outsideAtom, () => 0)
   for (const agent of agents) await writeSnapshot($, agent)
 }
@@ -535,6 +586,12 @@ function folderSegs(cells: readonly Cell[], total: number, col: Column): Seg[] {
   }
 }
 
+/** Lines of output the agent saw when Claude Code kept only a preview of it. */
+function previewLines(text: string): number {
+  const m = /Preview[^\n]*:\n([\s\S]*?)(?:\n\.\.\.)?\s*(?:<\/persisted-output>)?\s*$/.exec(text)
+  return m ? m[1]!.split('\n').length : 0
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     indexed = indexRepo($)
@@ -604,23 +661,45 @@ export const register: Register = on => {
   })
 
   on('tool.call', async ($, e, next) => {
-    const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError) return ran
-    await indexed
     const a = e.agentId ?? 'main'
     const tool = String(e.tool)
     const args = e as unknown as Record<string, unknown>
+    const command = tool === 'Bash' && typeof args.command === 'string' ? args.command : ''
+    // Before a command runs, look at the checkouts it works in, so what it changes stands out after.
+    let cwd = ''
+    if (command) {
+      await indexed
+      cwd = cwds.get(a) ?? sessionCwd
+      try {
+        const { places } = shellEffects(repo, command, cwd)
+        await placeOutside($, places)
+        await lookFirst($, checkoutsFor(places))
+      } catch (err) {
+        $.ui.log(`could not read a command: ${String((err as Error)?.message ?? err).slice(0, 80)}`)
+      }
+    }
+    const ran = await next(e)
+    if (ran.deny !== undefined || ran.isError) return ran
+    await indexed
     const result = ran.result as Record<string, any> | undefined
     const text = ran.text ?? ''
-    const pathArg = (k: string) => (typeof args[k] === 'string' ? relative(repo, args[k] as string) : null)
+    /** A path argument as the map knows it, with its absolute form; a worktree made since the index is found here. */
+    const pathArg = async (k: string) => {
+      const abs = typeof args[k] === 'string' ? absolute(args[k] as string, cwds.get(a) ?? sessionCwd, repo.home) : null
+      if (!abs) return null
+      await placeOutside($, [abs])
+      const p = logical(repo, abs)
+      return p ? { p, abs } : null
+    }
     try {
       const t = await $.clock.now()
       if (tool === 'Read') {
-        const p = pathArg('file_path')
-        if (!p) {
+        const at = await pathArg('file_path')
+        if (!at) {
           await update($, outsideAtom, n => n + 1)
           return ran
         }
+        const { p } = at
         const file = result?.file ?? {}
         const tok = tokensOf(text)
         if (result?.type === 'text') {
@@ -636,8 +715,9 @@ export const register: Register = on => {
           await record($, [{ k: 'read', t, a, p, r: [1, 1], tok, n: 1 }])
         }
       } else if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
-        const p = pathArg('file_path') || pathArg('notebook_path')
-        if (!p || result?.staged) return ran
+        const at = (await pathArg('file_path')) ?? (await pathArg('notebook_path'))
+        if (!at || result?.staged) return ran
+        const { p, abs } = at
         await ensureIndexed($, p)
         const { added, removed } = countPatch(result?.structuredPatch)
         if (tool === 'Write' && typeof result?.content === 'string') {
@@ -649,21 +729,49 @@ export const register: Register = on => {
           await record($, [{ k: 'edit', t, a, p, add: added, del: removed, hunks }])
         }
         // Take in the edit so the next shell command doesn't count it again.
-        await serial(() => snapshotChanges($, reposFor([p])))
+        await serial(() => snapshotChanges($, checkoutsFor([abs])))
       } else if (tool === 'Grep' || tool === 'Glob') {
-        const ps = pathsIn(repo, text)
+        const ps = pathsIn(repo, text, typeof args.path === 'string' ? absolute(args.path, sessionCwd, repo.home) ?? sessionCwd : sessionCwd)
         if (ps.length && ps.length <= MAX_HITS) await record($, [{ k: 'hit', t, a, ps, tok: tokensOf(text) }])
-      } else if (tool === 'Bash') {
-        const command = typeof args.command === 'string' ? args.command : ''
-        const { paths: mentioned, searched, cwd } = pathsInCommand(repo, command)
-        const edits = await freshEdits($, reposFor(mentioned, cwd))
-        const reads = mentioned.filter(p => !edits.includes(p))
-        const hits = [...new Set([...searched, ...pathsIn(repo, text, cwd)])].filter(p => !mentioned.includes(p) && !edits.includes(p))
+      } else if (command) {
+        const reset = /Shell cwd was reset to (\/[^\n]+)/.exec(text)
+        // First pass: which files the command prints from, to count their lines.
+        const wanted = new Set<string>()
+        shellEffects(repo, command, cwd, abs => (wanted.add(abs), undefined))
+        const totals = new Map<string, number>()
+        for (const abs of [...wanted].slice(0, 50)) {
+          try {
+            const body = await $.fs.read(abs)
+            // Counted as the Read tool counts (a trailing newline ends one more, empty, line), so a whole cat is a full read.
+            totals.set(abs, body.split('\n').length)
+          } catch {
+            // Gone, a directory, or never a file.
+          }
+        }
+        const fx = shellEffects(repo, command, cwd, abs => totals.get(abs), result?.persistedOutputPath ? previewLines(text) : undefined)
+        cwds.set(a, reset ? reset[1]!.trim() : fx.cwd)
+        const edits = (await freshEdits($, checkoutsFor(fx.places))).map(abs => logical(repo, abs)).filter((p): p is string => !!p)
+        const reads = fx.reads.filter(r => !edits.includes(r.path))
+        const readPaths = new Set(reads.map(r => r.path))
+        const hits = [...new Set([...fx.searched, ...pathsIn(repo, text, fx.cwd)])].filter(p => !readPaths.has(p) && !edits.includes(p))
+        // The output's tokens, shared by lines read; a read of unknown lines weighs as much as an average one.
         const share = tokensOf(text)
+        const known = reads.filter(r => r.range).map(r => r.range![1] - r.range![0] + 1)
+        const avg = known.length ? known.reduce((x, y) => x + y, 0) / known.length : 1
+        const weight = (r: (typeof reads)[number]) => (r.range ? r.range[1] - r.range[0] + 1 : avg)
+        const sum = reads.reduce((n, r) => n + weight(r), 0)
         for (const p of edits) await ensureIndexed($, p)
         await record($, [
           ...(hits.length && hits.length <= MAX_HITS ? [{ k: 'hit' as const, t, a, ps: hits, tok: reads.length ? 0 : share }] : []),
-          ...reads.map(p => ({ k: 'read' as const, t, a, p, r: null, tok: Math.ceil(share / reads.length) })),
+          ...reads.map(r => ({
+            k: 'read' as const,
+            t,
+            a,
+            p: r.path,
+            r: r.range,
+            tok: Math.ceil((share * weight(r)) / sum),
+            ...(totals.has(r.abs) ? { n: Math.max(1, totals.get(r.abs)!) } : {}),
+          })),
           ...edits.map(p => ({ k: 'edit' as const, t, a, p, add: 0, del: 0, shell: true as const })),
         ])
       }
@@ -680,6 +788,7 @@ export const register: Register = on => {
     const lines = await read($, linesAtom)
     const known = await read($, agentsAtom)
     const pick = await read($, pickAtom)
+    const anchor = await read($, anchorAtom)
     const closed = new Set(await read($, closedAtom))
     const selected = await read($, selectedAtom)
     const outside = await read($, outsideAtom)
@@ -707,10 +816,11 @@ export const register: Register = on => {
       agents.filter(a => (shown === 'all' || a.id === shown) && a.now && isRunning(a) && now - a.nowAt < (a.id === 'main' ? NOW_MS : 120_000)).map(a => a.now!),
     )
 
-    // Rows: every file any agent touched, so switching agents never moves them.
-    const touched = new Set<string>()
-    for (const mine of Object.values(holds)) for (const path of Object.keys(mine)) touched.add(path)
-    const { count, children } = folderIndex(touched)
+    // Rows: in all, every file any agent touched; for one agent, the files it knows, its subagents' included.
+    const everTouched = new Set<string>()
+    for (const mine of Object.values(holds)) for (const path of Object.keys(mine)) everTouched.add(path)
+    const touched = shown === 'all' ? everTouched : new Set([...everTouched].filter(p => level(holds, agents, shown, p, lines[p])))
+    const { count, children } = folderIndex(everTouched)
     const isTouchedDir = (dir: string) => [...touched].some(p => p.startsWith(dir + '/'))
     // Each row's name is its indent, a marker and the last part of its path.
     const wantName = Math.max(
@@ -726,10 +836,10 @@ export const register: Register = on => {
     const AGENT_COL = 8
     const teamTail = COLUMNS.filter(c => c.key === 'tokens' || c.key === 'last')
     const tailW = teamTail.reduce((n, c) => n + c.width, 0)
-    // Every agent gets a column, left-out ones too (dimmed and empty), so the person can bring them back.
-    let fit = agentsAll.length
+    // Agents left out lose their column; they're listed under the grid to bring back.
+    let fit = agents.length
     while (isTeam && fit > 1 && width - 1 - fit * AGENT_COL - tailW < MIN_NAME) fit--
-    const teamAgents = agentsAll.slice(0, fit)
+    const teamAgents = agents.slice(0, fit)
     const { name: nameW, cols } = isTeam
       ? { name: Math.max(MIN_NAME, Math.min(wantName, width - 1 - fit * AGENT_COL - tailW)), cols: teamTail }
       : columnsFor(width - 1, wantName)
@@ -737,13 +847,11 @@ export const register: Register = on => {
     const agentCol = (segs: Seg[]) => fitSegs([{ t: '   ' }, ...segs], AGENT_COL)
     const teamFile = (p: string): Seg[] =>
       teamAgents.flatMap(a => {
-        if (excluded.has(a.id)) return agentCol([])
         const l = level(holds, agents, a.id, p, lines[p])
         return agentCol(l ? [{ t: GLYPH[l], c: LEVEL_COLOR[l] }] : [{ t: '·', c: FAINT }])
       })
     const teamDir = (inside: readonly string[]): Seg[] =>
       teamAgents.flatMap(a => {
-        if (excluded.has(a.id)) return agentCol([])
         const ls = inside.map(p => level(holds, agents, a.id, p, lines[p])).filter((l): l is Level => !!l)
         if (!ls.length) return agentCol([{ t: '·', c: FAINT }])
         const best = [...ls].sort((x, y) => RANK[y] - RANK[x])[0]!
@@ -803,19 +911,26 @@ export const register: Register = on => {
     walkDir('', 0)
 
     // The picker: a row of agents in spawn order that scrolls to keep the picked one in view.
-    // h and l step through them, m jumps to main, a to all.
+    // h and l step through them, m jumps to main, a to all. In all, the row stays where the
+    // last agent picked left it, and h and l step on from that agent.
     const order = agentsAll
-    const at = order.findIndex(a => a.id === shown)
-    const go = (id: string) => () => void update($, pickAtom, () => id)
+    const at = order.findIndex(a => a.id === (shown === 'all' ? anchor : shown))
+    const go = (id: string) => () =>
+      void (async () => {
+        if (id !== 'all') await update($, anchorAtom, () => id)
+        await update($, pickAtom, () => id)
+      })()
     const stepTo = (d: number) => order[at < 0 ? (d > 0 ? 0 : order.length - 1) : Math.max(0, Math.min(order.length - 1, at + d))]!.id
     const itemLabel = (a: GpsAgent) => {
       const status = a.id === 'main' ? '' : a.doneAt === null ? ' ◆' : ' ✓'
       const text = `${excluded.has(a.id) ? '⊘' : ''}${names.get(a.id)}${status}`
       return a.id === shown ? `[${text}]` : text
     }
+    // The anchor in all is measured as if still picked, so the row keeps its exact place.
+    const placeLabel = (a: GpsAgent) => (shown === 'all' && a.id === anchor ? `[${itemLabel(a)}]` : itemLabel(a))
     // Fixed parts: the title, the two scroll ends and all, with their hotkeys and gaps.
     const fixed = '◉ Coverage'.length + 'h: ‹ 99'.length + '99 › :l'.length + 'a: all'.length + 8
-    const widthOf = (a: GpsAgent) => itemLabel(a).length + (a.id === 'main' ? 3 : 0) + 2
+    const widthOf = (a: GpsAgent) => placeLabel(a).length + (a.id === 'main' ? 3 : 0) + 2
     let lo = Math.max(0, at)
     let hi = lo
     let used = order.length ? widthOf(order[lo]!) : 0
@@ -924,23 +1039,38 @@ export const register: Register = on => {
                   key={'out:' + a.id}
                   plain
                   hotkey={i < 9 ? String(i + 1) : undefined}
-                  dimColor={excluded.has(a.id)}
-                  label={(excluded.has(a.id) ? '⊘' : '') + names.get(a.id)}
+                  label={names.get(a.id) ?? a.id}
                   onPress={toggleOut(a.id)}
                 />
               </Box>
             ))}
           <Text dimColor>
             {cols.map(c => (c.align === 'right' ? c.title.padStart(c.width) : c.title.padEnd(c.width))).join('')}
-            {isTeam && fit < agentsAll.length ? `  +${agentsAll.length - fit} agents` : ''}
+            {isTeam && fit < agents.length ? `  +${agents.length - fit} agents` : ''}
           </Text>
         </Box>
         {touched.size === 0 ? (
           <Text dimColor wrap="wrap">
-            Nothing read yet. Files appear here as Claude and its subagents read, search and edit them, with what each one holds.
+            {isTeam && excluded.size && !agents.length
+              ? 'Every agent is left out.'
+              : everTouched.size === 0
+              ? 'Nothing read yet. Files appear here as Claude and its subagents read, search and edit them, with what each one holds.'
+              : `${names.get(shown) ?? shown} hasn’t read, searched or edited a file yet.`}
           </Text>
         ) : (
           rows
+        )}
+        {/* The agents left out of all: each one comes back on a click, all of them on 0. */}
+        {isTeam && excluded.size > 0 && (
+          <Box key="left-out" marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
+            <Text color={LEVEL_COLOR.X}>left out</Text>
+            {agentsAll
+              .filter(a => excluded.has(a.id))
+              .map(a => (
+                <Button key={'in:' + a.id} plain dimColor label={'⊘' + (names.get(a.id) ?? a.id)} onPress={toggleOut(a.id)} />
+              ))}
+            <Button key="in:all" plain hotkey="0" label="bring all back" onPress={() => void update($, excludedAtom, () => [])} />
+          </Box>
         )}
         {detail}
         <Box marginTop={1} flexDirection="row" flexWrap="wrap">
@@ -953,7 +1083,7 @@ export const register: Register = on => {
           </Text>
         </Box>
         <Text color={FAINT} wrap="wrap">
-          click a file for its detail, a folder to fold it{isTeam ? ' · an agent’s number leaves it out of all' : ''}
+          click a file for its detail, a folder to fold it{isTeam ? ' · an agent’s number leaves it out' : ''}
         </Text>
       </Box>
     )

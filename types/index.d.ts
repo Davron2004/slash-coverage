@@ -55,6 +55,8 @@ declare module 'claude-code' {
       agents: GpsAgent[]
       /** 'auto' follows the transcript on screen; otherwise an agent id or 'all'. */
       pick: string
+      /** The agent picked last: in all, the picker row stays scrolled to it. */
+      anchor: string | null
       /** Agents the person left out of the all view. */
       excluded: string[]
       /** Folders the person folded. */
